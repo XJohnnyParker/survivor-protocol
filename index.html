@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=yes">
+<title>幸存者协议 · Survivor Protocol</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #07090d; overflow: hidden;
+    font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas {
+    display: block; touch-action: none; -webkit-user-select: none; user-select: none;
+    box-shadow: 0 12px 70px rgba(0, 0, 0, .65); border-radius: 12px;
+    cursor: crosshair;
+  }
+</style>
+</head>
+<body>
+  <canvas id="cv"></canvas>
+  <script src="game.js"></script>
+</body>
+</html>
