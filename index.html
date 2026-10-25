@@ -2,20 +2,29 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=yes">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#07090d">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>幸存者协议 · Survivor Protocol</title>
 <style>
   html, body {
     margin: 0; padding: 0; height: 100%;
     background: #07090d; overflow: hidden;
+    overscroll-behavior: none;                 /* 手机上别下拉刷新 / 别橡皮筋 */
+    -webkit-tap-highlight-color: transparent;  /* 别闪蓝框 */
     font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
   }
   body { display: flex; align-items: center; justify-content: center; }
   canvas {
     display: block; touch-action: none; -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;                /* iOS 长按别弹菜单 */
     box-shadow: 0 12px 70px rgba(0, 0, 0, .65); border-radius: 12px;
     cursor: crosshair;
   }
+  /* 触屏设备上不要十字准星：右手是按在屏幕上开火的 */
+  @media (pointer: coarse) { canvas { cursor: default; border-radius: 0; box-shadow: none; } }
 </style>
 </head>
 <body>

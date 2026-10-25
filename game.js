@@ -15,7 +15,8 @@
   const ctx = cv.getContext('2d');
 
   function resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // 手机上按 2 倍像素密度渲染 1280x720 会烧 GPU，触屏设备封顶 1.5 倍
+    const dpr = Math.min(window.devicePixelRatio || 1, MOBILE ? 1.5 : 2);
     const s = Math.min(window.innerWidth / W, window.innerHeight / H);
     const cw = Math.max(320, Math.floor(W * s)), ch = Math.floor(H * s);
     cv.style.width = cw + 'px';
@@ -93,10 +94,66 @@
     banner: null,                     // { text, t }
     choices: [], pendingLevels: 0,
     levelFx: 0, muted: false, best: 0,
+    settings: false,                  // 左上角 ⚙ 设置面板是否打开（打开时世界冻结）
     shake: 0,
   };
   const keys = Object.create(null);
   const mouse = { x: W / 2, y: H / 2, down: false };
+
+  // ==================== 手机模式（触屏操作） ====================
+  // 手机 / 平板上两套手势同时走：
+  //   左手 —— 屏幕左下方按住拖动 = 虚拟摇杆（拖动原点跟着按下点走，不固定死）
+  //   右手 —— 屏幕任意其他地方按住 = "点哪打哪"：枪口指向按下的那个世界坐标点，
+  //           按住不放就持续开火；手指移动，瞄准点跟着移动
+  // 键盘 / 鼠标的路径完全没动，桌面照旧，带触屏的笔记本也能两套混用。
+  //
+  // 手机模式本身可以在左上角的 ⚙ 设置里开关（记在 localStorage），
+  // 地址栏的 ?touch=1 / ?touch=0 是给自动化测试用的强制开关。
+  const TOUCH_URL = (function () {
+    try {
+      if (/[?&]touch=1\b/.test(location.search)) return true;
+      if (/[?&]touch=0\b/.test(location.search)) return false;
+    } catch (e) { /* 没有 location 的极端环境 */ }
+    return null;
+  })();
+  // 设备本身有没有触屏（只用来说明"默认该开还是该关"）
+  const TOUCH_CAP = TOUCH_URL !== null ? TOUCH_URL : (function () {
+    try {
+      return (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ||
+             ('ontouchstart' in window);
+    } catch (e) { return false; }
+  })();
+  const MOBILE_KEY = 'sp-mobile-mode';
+  let MOBILE = (function () {
+    if (TOUCH_URL !== null) return TOUCH_URL;      // 网址强制，不读存档
+    try {
+      const saved = localStorage.getItem(MOBILE_KEY);
+      if (saved === '1') return true;
+      if (saved === '0') return false;
+    } catch (e) { /* 无痕模式可能禁 localStorage */ }
+    return TOUCH_CAP;                              // 默认跟着设备能力
+  })();
+  function setMobileMode(on) {
+    MOBILE = !!on;
+    if (!MOBILE) touchReset();
+    else touch.hint = 6;                           // 打开时给一次操作提示
+    try { localStorage.setItem(MOBILE_KEY, MOBILE ? '1' : '0'); } catch (e) {}
+  }
+  // 摇杆几何：STICK.x/y 是"没被按住时"提示圈的位置，真正生效的原点是按下点
+  const STICK = { x: 152, y: H - 176, r: 92, knob: 46, zoneX: 0.46, zoneY: 0.44 };
+  const touch = {
+    moveId: null, ox: 0, oy: 0, mx: 0, my: 0,   // 摇杆：按下原点 + 当前手指点
+    aimId: null, ax: 0, ay: 0,                  // 瞄准：按下点（逻辑屏幕坐标）
+    hint: 0,                                    // 开场提示剩余秒数
+  };
+  // 准星的"最后落点"（逻辑屏幕坐标）：鼠标和手指都往这里写，
+  // 松手之后枪口就停在那，而不是跳回某个过期的鼠标位置。
+  const aimPoint = { x: W / 2 + 160, y: H / 2 };
+  const touchReset = function () {
+    touch.moveId = null; touch.aimId = null;
+    touch.ox = touch.oy = touch.mx = touch.my = 0;
+  };
+
 
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   const rand = (a, b) => a + Math.random() * (b - a);
@@ -247,6 +304,10 @@
     S.packs.length = 0; S.floats.length = 0; S.packT = HEALPACK.every;
     S.banner = { text: '第 1 波', t: 1.0 };
     S.choices = []; S.pendingLevels = 0; S.levelFx = 0; S.shake = 0;
+    touchReset();                 // 换局时把没松开的手指状态清掉
+    touch.hint = MOBILE ? 9 : 0;   // 手机上开局给 9 秒操作提示
+    S.settings = false;
+    S.pauseReturn = 'playing';
   }
 
   // ==================== 生成 ====================
@@ -377,12 +438,22 @@
     if (keys['s'] || keys['arrowdown']) dy += 1;
     if (keys['a'] || keys['arrowleft']) dx -= 1;
     if (keys['d'] || keys['arrowright']) dx += 1;
-    const len = Math.hypot(dx, dy);
-    if (len > 0) { dx /= len; dy /= len; }
+    // 触屏摇杆：按偏离原点的距离给"模拟量"（推一半就半速走），推满才满速
+    if (touch.moveId !== null) {
+      const ox = touch.mx - touch.ox, oy = touch.my - touch.oy;
+      const dist = Math.hypot(ox, oy);
+      if (dist > 6) {
+        const amount = Math.min(1, dist / STICK.r);       // 0..1 的油门
+        dx += (ox / dist) * amount;
+        dy += (oy / dist) * amount;
+      }
+    }
+    let len = Math.hypot(dx, dy);
+    if (len > 1) { dx /= len; dy /= len; len = 1; }
 
     // 目标速度：有输入时朝着满速，没输入时是 0 —— 用指数逼近做出加速 / 阻尼滑行
     const tvx = dx * P.speed, tvy = dy * P.speed;
-    const rate = len > 0 ? MOVE.accel : MOVE.damp;
+    const rate = len > 0.02 ? MOVE.accel : MOVE.damp;
     const k = 1 - Math.exp(-rate * dt);
     P.vx += (tvx - P.vx) * k;
     P.vy += (tvy - P.vy) * k;
@@ -407,12 +478,14 @@
       if (P.trail[i].t <= 0) P.trail.splice(i, 1);
     }
 
-    // 鼠标是屏幕坐标，玩家是世界坐标 —— 先换算成世界坐标再算朝向（摄像机跟随之后必须这么做）
-    const mwx = mouse.x + (S.cam.x - W / 2);
-    const mwy = mouse.y + (S.cam.y - H / 2);
+    // 瞄准点用屏幕坐标给出（鼠标 / 按下的手指都写在 aimPoint 里），
+    // 玩家是世界坐标 —— 先换算成世界坐标再算朝向（摄像机跟随之后必须这么做）
+    const mwx = aimPoint.x + (S.cam.x - W / 2);
+    const mwy = aimPoint.y + (S.cam.y - H / 2);
     P.aim = Math.atan2(mwy - P.y, mwx - P.x);
     P.cdLeft -= dt;
-    if (mouse.down && P.cdLeft <= 0) { shoot(); P.cdLeft = P.cooldown; }
+    const held = mouse.down || touch.aimId !== null;      // 点着不放 = 持续开火
+    if (held && P.cdLeft <= 0) { shoot(); P.cdLeft = P.cooldown; }
     P.flash = Math.max(0, P.flash - dt);
     P.hurt = Math.max(0, P.hurt - dt);
   }
@@ -1063,6 +1136,318 @@
       ctx.fillText(S.banner.text, W / 2, H / 2 - 130);
       ctx.restore();
     }
+    drawGear();     // 左上角 ⚙：手机模式 / 音效 的开关入口
+  }
+
+  // ==================== 触屏界面（摇杆 / 准星 / 顶栏按钮） ====================
+  function goFullscreen() {
+    const el = document.documentElement;
+    try {
+      if (document.fullscreenElement || document.webkitFullscreenElement) {
+        if (document.exitFullscreen) document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        return;
+      }
+      if (el.requestFullscreen) el.requestFullscreen({ navigationUI: 'hide' }).catch(function () {});
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    } catch (e) { /* iPhone 的 Safari 不支持元素全屏，忽略就好 */ }
+    // 横屏锁屏：只在支持的地方生效（安卓 Chrome / 部分浏览器）
+    try {
+      if (screen.orientation && screen.orientation.lock) {
+        const r = screen.orientation.lock('landscape');
+        if (r && r.catch) r.catch(function () {});
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+
+  // 顶栏三个按钮（暂停 / 静音 / 全屏）：每帧重建，位置跟着 HUD 走
+  function touchButtons() {
+    const w = 56, h = 40, gap = 8, y = 246;
+    let x = W - 24 - w;
+    const list = [];
+    list.push({ id: 'full', x: x, y: y, w: w, h: h, fn: goFullscreen });
+    x -= w + gap;
+    list.push({ id: 'mute', x: x, y: y, w: w, h: h, on: S.muted,
+                fn: function () { S.muted = !S.muted; } });
+    x -= w + gap;
+    const paused = S.state === 'paused';
+    list.push({ id: 'pause', x: x, y: y, w: w, h: h, on: paused,
+                fn: function () {
+                  if (S.state === 'paused') { S.state = S.pauseReturn || 'playing'; }
+                  else if (S.state === 'playing' || S.state === 'break') {
+                    S.pauseReturn = S.state;
+                    S.state = 'paused';
+                  }
+                } });
+    return list;
+  }
+  function hitTouchButton(p) {
+    const list = touchButtons();
+    for (let i = 0; i < list.length; i++) {
+      const b = list[i];
+      // 手指比鼠标粗，命中框外扩一圈
+      if (hitRect(p.x, p.y, b.x - 6, b.y - 6, b.w + 12, b.h + 12)) return b;
+    }
+    return null;
+  }
+
+  function drawTouchUi() {
+    const playing = S.state === 'playing' || S.state === 'break' || S.state === 'paused';
+
+    // --- 左手摇杆 ---
+    if (playing) {
+      const active = touch.moveId !== null;
+      const ox = active ? touch.ox : STICK.x;
+      const oy = active ? touch.oy : STICK.y;
+      ctx.save();
+      ctx.globalAlpha = active ? 0.9 : 0.30;
+      // 底盘
+      ctx.beginPath();
+      ctx.arc(ox, oy, STICK.r, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(10,16,26,.45)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(120,170,255,.7)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // 摇杆头
+      let kx = ox, ky = oy;
+      if (active) {
+        const vx = touch.mx - touch.ox, vy = touch.my - touch.oy;
+        const d = Math.hypot(vx, vy);
+        const capD = Math.min(d, STICK.r);
+        if (d > 0.001) { kx = ox + (vx / d) * capD; ky = oy + (vy / d) * capD; }
+      }
+      ctx.beginPath();
+      ctx.arc(kx, ky, STICK.knob, 0, Math.PI * 2);
+      ctx.fillStyle = active ? 'rgba(143,208,255,.55)' : 'rgba(143,208,255,.30)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(200,230,255,.85)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      if (!active) {
+        ctx.globalAlpha = 0.5;
+        ctx.textAlign = 'center';
+        ctx.font = '600 13px "PingFang SC","Microsoft YaHei",sans-serif';
+        ctx.fillStyle = '#a9c4e6';
+        ctx.fillText('拖动移动', ox, oy + 4);
+      }
+      ctx.restore();
+    }
+
+    // --- 右手瞄准点：按着的地方画个准星，顺便把射线拖出来 ---
+    if (playing && touch.aimId !== null) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,209,102,.85)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(touch.ax, touch.ay, 16, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(touch.ax - 24, touch.ay); ctx.lineTo(touch.ax - 8, touch.ay);
+      ctx.moveTo(touch.ax + 8, touch.ay); ctx.lineTo(touch.ax + 24, touch.ay);
+      ctx.moveTo(touch.ax, touch.ay - 24); ctx.lineTo(touch.ax, touch.ay - 8);
+      ctx.moveTo(touch.ax, touch.ay + 8); ctx.lineTo(touch.ax, touch.ay + 24);
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(255,209,102,.9)';
+      ctx.beginPath();
+      ctx.arc(touch.ax, touch.ay, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // --- 顶栏按钮 ---
+    if (playing) {
+      const list = touchButtons();
+      for (let i = 0; i < list.length; i++) drawTouchButton(list[i]);
+    }
+
+    // --- 开局提示 ---
+    if (playing && touch.hint > 0) {
+      const a = Math.min(1, touch.hint / 1.2) * 0.9;
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.textAlign = 'center';
+      ctx.font = '700 17px "PingFang SC","Microsoft YaHei",sans-serif';
+      ctx.fillStyle = 'rgba(8,12,18,.62)';
+      roundRect(W / 2 - 250, H - 132, 500, 44, 12);
+      ctx.fill();
+      ctx.fillStyle = '#dbe9ff';
+      ctx.fillText('左下拖动走位 · 按住屏幕任意处朝那个点开枪', W / 2, H - 103);
+      ctx.restore();
+    }
+  }
+
+  function drawTouchButton(b) {
+    ctx.save();
+    ctx.fillStyle = b.on ? 'rgba(90,160,255,.35)' : 'rgba(8,12,18,.55)';
+    roundRect(b.x, b.y, b.w, b.h, 10);
+    ctx.fill();
+    ctx.strokeStyle = b.on ? 'rgba(150,200,255,.9)' : 'rgba(120,170,255,.35)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    ctx.strokeStyle = '#cfe0ff';
+    ctx.fillStyle = '#cfe0ff';
+    ctx.lineWidth = 2.4;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    if (b.id === 'pause') {
+      if (b.on) {                                  // ▶
+        ctx.moveTo(cx - 6, cy - 9); ctx.lineTo(cx + 9, cy); ctx.lineTo(cx - 6, cy + 9);
+        ctx.closePath(); ctx.fill();
+      } else {                                     // ⏸
+        ctx.moveTo(cx - 6, cy - 9); ctx.lineTo(cx - 6, cy + 9);
+        ctx.moveTo(cx + 6, cy - 9); ctx.lineTo(cx + 6, cy + 9);
+        ctx.stroke();
+      }
+    } else if (b.id === 'mute') {                   // 喇叭 +（静音时）一道斜杠
+      ctx.moveTo(cx - 10, cy - 4); ctx.lineTo(cx - 4, cy - 4);
+      ctx.lineTo(cx + 3, cy - 10); ctx.lineTo(cx + 3, cy + 10);
+      ctx.lineTo(cx - 4, cy + 4); ctx.lineTo(cx - 10, cy + 4);
+      ctx.closePath();
+      ctx.stroke();
+      if (b.on) {
+        ctx.beginPath();
+        ctx.moveTo(cx + 7, cy - 7); ctx.lineTo(cx + 15, cy + 7);
+        ctx.moveTo(cx + 15, cy - 7); ctx.lineTo(cx + 7, cy + 7);
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(cx + 4, cy, 8, -0.9, 0.9);
+        ctx.stroke();
+      }
+    } else {                                        // 全屏：四个角
+      const a = 7, e = 13;
+      ctx.moveTo(cx - e, cy - e + a); ctx.lineTo(cx - e, cy - e); ctx.lineTo(cx - e + a, cy - e);
+      ctx.moveTo(cx + e - a, cy - e); ctx.lineTo(cx + e, cy - e); ctx.lineTo(cx + e, cy - e + a);
+      ctx.moveTo(cx + e, cy + e - a); ctx.lineTo(cx + e, cy + e); ctx.lineTo(cx + e - a, cy + e);
+      ctx.moveTo(cx - e + a, cy + e); ctx.lineTo(cx - e, cy + e); ctx.lineTo(cx - e, cy + e - a);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ==================== 设置面板（左上角 ⚙） ====================
+  // 现在只有两项：手机模式（触屏摇杆 / 点哪打哪）和音效。
+  // 打开面板时世界冻结 —— 不然玩家在菜单里被怪打死，那是设计事故。
+  const GEAR = { x: 18, y: 104, w: 40, h: 40 };
+  const GEAR_HIT = { x: GEAR.x, y: GEAR.y, w: GEAR.w, h: GEAR.h };
+  function inBox(p, b) {
+    return hitRect(p.x, p.y, b.x - 6, b.y - 6, b.w + 12, b.h + 12);
+  }
+  function settingsLayout() {
+    const w = 540, h = 272;
+    const x = (W - w) / 2, y = (H - h) / 2;
+    return {
+      x: x, y: y, w: w, h: h,
+      mobile: { x: x + w - 110, y: y + 74, w: 70, h: 36 },
+      sound: { x: x + w - 110, y: y + 140, w: 70, h: 36 },
+      close: { x: x + w / 2 - 76, y: y + h - 64, w: 152, h: 44 },
+    };
+  }
+  function drawToggle(b, on) {
+    ctx.save();
+    ctx.fillStyle = on ? 'rgba(90,160,255,.9)' : 'rgba(255,255,255,.14)';
+    roundRect(b.x, b.y, b.w, b.h, b.h / 2);
+    ctx.fill();
+    ctx.strokeStyle = on ? 'rgba(180,220,255,.95)' : 'rgba(150,175,210,.5)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    const r = b.h / 2 - 4;
+    const cx = on ? b.x + b.w - b.h / 2 : b.x + b.h / 2;
+    ctx.beginPath();
+    ctx.arc(cx, b.y + b.h / 2, r, 0, Math.PI * 2);
+    ctx.fillStyle = on ? '#fff' : '#9fb6d6';
+    ctx.fill();
+    // ON / OFF 字样贴在开关另一侧
+    ctx.font = '700 11px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = on ? '#dff0ff' : '#7f93ad';
+    ctx.textAlign = on ? 'right' : 'left';
+    ctx.fillText(on ? 'ON' : 'OFF', on ? b.x - 8 : b.x + b.w + 8, b.y + b.h / 2 + 4);
+    ctx.restore();
+  }
+  function drawGear() {
+    const cx = GEAR.x + GEAR.w / 2, cy = GEAR.y + GEAR.h / 2;
+    ctx.save();
+    ctx.fillStyle = 'rgba(8,12,18,.55)';
+    roundRect(GEAR.x, GEAR.y, GEAR.w, GEAR.h, 10);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(120,170,255,.35)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // 齿轮：8 颗齿 + 内外两圈
+    ctx.strokeStyle = S.settings ? '#ffd166' : '#a9c4e6';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 11, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+    ctx.stroke();
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * 11, cy + Math.sin(a) * 11);
+      ctx.lineTo(cx + Math.cos(a) * 15, cy + Math.sin(a) * 15);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function drawSettings() {
+    const L = settingsLayout();
+    ctx.save();
+    ctx.fillStyle = 'rgba(4,7,12,.74)';
+    ctx.fillRect(0, 0, W, H);
+    // 卡片
+    ctx.fillStyle = 'rgba(10,16,26,.96)';
+    roundRect(L.x, L.y, L.w, L.h, 16);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(120,170,255,.35)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // 标题
+    ctx.textAlign = 'left';
+    ctx.font = '800 24px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = '#e8f0ff';
+    ctx.fillText('设置', L.x + 28, L.y + 44);
+    ctx.strokeStyle = 'rgba(255,255,255,.10)';
+    ctx.beginPath();
+    ctx.moveTo(L.x + 24, L.y + 60);
+    ctx.lineTo(L.x + L.w - 24, L.y + 60);
+    ctx.stroke();
+    // 行 1：手机模式
+    ctx.font = '700 17px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = '#dbe9ff';
+    ctx.fillText('手机模式', L.x + 28, L.y + 98);
+    ctx.font = '500 13px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = '#8fa6c6';
+    ctx.fillText('左侧虚拟摇杆 + 右手点哪打哪（触屏设备默认开）', L.x + 28, L.y + 126);
+    drawToggle(L.mobile, MOBILE);
+    // 行 2：音效
+    ctx.font = '700 17px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = '#dbe9ff';
+    ctx.fillText('音效', L.x + 28, L.y + 164);
+    ctx.font = '500 13px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = '#8fa6c6';
+    ctx.fillText('WebAudio 现场合成，没有音频文件', L.x + 28, L.y + 192);
+    drawToggle(L.sound, !S.muted);
+    // 关掉手机模式时给一句人话，免得读者以为"功能没了"
+    ctx.font = '500 12px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = '#6c86a8';
+    ctx.fillText(MOBILE ? '当前：手机模式（触屏可用）' : '当前：键鼠模式（触屏 UI 已隐藏）',
+                 L.x + 28, L.y + 218);
+    // 关闭按钮
+    ctx.fillStyle = 'rgba(90,160,255,.22)';
+    roundRect(L.close.x, L.close.y, L.close.w, L.close.h, 12);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(150,200,255,.6)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.font = '700 17px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = '#dbe9ff';
+    ctx.fillText('关闭', L.close.x + L.close.w / 2, L.close.y + 29);
+    ctx.restore();
   }
 
   function heartPath(x, y, r) {
@@ -1089,6 +1474,12 @@
     ctx.fillStyle = '#5b6f8f';
     ctx.fillText('历史最长存活 ' + fmt(S.best), W / 2, H / 2 + 40);
     button('开始游戏', W / 2 - 110, H / 2 + 78, 220, 56);
+    // 标题界面也能进设置（手机上开局前就能确认手机模式是开的）
+    ctx.font = '500 13px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillStyle = '#5b6f8f';
+    ctx.fillText(MOBILE ? '当前：手机模式（左手摇杆 · 右手点哪打哪）' : '当前：键鼠模式（左上角 ⚙ 可切到手机模式）',
+                 W / 2, H / 2 + 168);
+    drawGear();
   }
 
   function drawUpgrade() {
@@ -1206,12 +1597,15 @@
     lastT = now;
     dt = Math.min(0.05, Math.max(0, dt));
 
-    if (S.state === 'playing' || S.state === 'break') update(dt);
+    if (S.settings) {
+      // 设置面板打开时冻结整个世界：菜单里被怪打死是最亏的死法
+    } else if (S.state === 'playing' || S.state === 'break') update(dt);
     else {
       S.t += dt;
       if (S.banner) { S.banner.t -= dt; if (S.banner.t <= 0) S.banner = null; }
       updateParticles(dt);
     }
+    if (touch.hint > 0) touch.hint -= dt;     // 开局操作提示的倒计时（暂停时也照常走）
 
     ctx.save();
     if (S.shake > 0) ctx.translate(rand(-S.shake, S.shake) * 0.5, rand(-S.shake, S.shake) * 0.5);
@@ -1269,6 +1663,7 @@
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, W, H);
     if (S.state !== 'title') drawHud();
+    if (MOBILE && !S.settings) drawTouchUi();
     if (S.state === 'title') drawTitle();
     else if (S.state === 'upgrade') drawUpgrade();
     else if (S.state === 'dead') drawEnd(false);
@@ -1284,8 +1679,9 @@
       ctx.fillText('已暂停', W / 2, H / 2);
       ctx.font = '500 16px "PingFang SC","Microsoft YaHei",sans-serif';
       ctx.fillStyle = '#8fa6c6';
-      ctx.fillText('按 Esc 继续', W / 2, H / 2 + 34);
+      ctx.fillText(MOBILE ? '点屏幕继续' : '按 Esc 继续', W / 2, H / 2 + 34);
     }
+    if (S.settings) drawSettings();      // 设置面板画在最上面
     requestAnimationFrame(frame);
   }
 
@@ -1295,26 +1691,33 @@
     return { x: (ev.clientX - r.left) / Math.max(1, r.width) * W,
              y: (ev.clientY - r.top) / Math.max(1, r.height) * H };
   }
-  window.addEventListener('keydown', function (e) {
-    const k = e.key.toLowerCase();
-    keys[k] = true;
-    if (k === 'escape') {
-      if (S.state === 'playing') S.state = 'paused';
-      else if (S.state === 'paused') S.state = 'playing';
+  const isTouchPointer = function (e) {
+    return e.pointerType === 'touch' || e.pointerType === 'pen';
+  };
+
+  // 一根手指落下：先判设置面板 → 齿轮 → 界面态 → 顶栏按钮 → 摇杆区 / 瞄准区
+  function onPointerDown(e) {
+    const p = toLogical(e);
+    const finger = isTouchPointer(e);
+    if (!finger) { mouse.x = p.x; mouse.y = p.y; aimPoint.x = p.x; aimPoint.y = p.y; }
+
+    // ---- 设置面板：打开时吃掉所有输入，点面板外就关掉 ----
+    if (S.settings) {
+      const L = settingsLayout();
+      if (inBox(p, L.mobile)) { setMobileMode(!MOBILE); return; }
+      if (inBox(p, L.sound)) { S.muted = !S.muted; return; }
+      if (inBox(p, L.close)) { S.settings = false; return; }
+      S.settings = false;                 // 点面板外面也当关闭（不误开火）
+      return;
     }
-    if (k === 'm') S.muted = !S.muted;
-    if (k === 'r' && (S.state === 'dead' || S.state === 'win' || S.state === 'title')) reset();
-    if ((k === ' ' || k === 'enter') && S.state === 'title') reset();
-    if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].indexOf(k) >= 0) {
-      e.preventDefault();
+    // ---- 左上角齿轮：进设置（标题界面也能开）----
+    if (S.state !== 'upgrade' && inBox(p, GEAR_HIT)) {
+      S.settings = true;
+      touchReset();
+      return;
     }
-  });
-  window.addEventListener('keyup', function (e) { keys[e.key.toLowerCase()] = false; });
-  cv.addEventListener('pointermove', function (e) {
-    const p = toLogical(e); mouse.x = p.x; mouse.y = p.y;
-  });
-  cv.addEventListener('pointerdown', function (e) {
-    const p = toLogical(e); mouse.x = p.x; mouse.y = p.y;
+
+    // 任何"界面态"下先吃掉触摸，别让它变成开火
     if (S.state === 'title') { reset(); return; }
     if (S.state === 'dead' || S.state === 'win') { reset(); return; }
     if (S.state === 'upgrade') {
@@ -1324,13 +1727,84 @@
       }
       return;
     }
-    if (S.state === 'paused') { S.state = 'playing'; return; }
+    if (MOBILE) {
+      const b = hitTouchButton(p);
+      if (b) { b.fn(); return; }
+    }
+    if (S.state === 'paused') { S.state = S.pauseReturn || 'playing'; return; }
+
+    if (finger) {
+      // 左下角：虚拟摇杆（原点就是按下的地方）—— 只在手机模式下生效
+      if (MOBILE && p.x < W * STICK.zoneX && p.y > H * STICK.zoneY && touch.moveId === null) {
+        touch.moveId = e.pointerId === undefined ? 1 : e.pointerId;
+        touch.ox = touch.mx = p.x;
+        touch.oy = touch.my = p.y;
+        return;
+      }
+      // 其他地方：点哪打哪
+      if (touch.aimId === null) {
+        touch.aimId = e.pointerId === undefined ? 2 : e.pointerId;
+        touch.ax = p.x; touch.ay = p.y;
+        aimPoint.x = p.x; aimPoint.y = p.y;
+      }
+      return;
+    }
     mouse.down = true;
+  }
+
+  function onPointerMove(e) {
+    const p = toLogical(e);
+    if (isTouchPointer(e)) {
+      if (touch.moveId !== null && touch.moveId === e.pointerId) {
+        touch.mx = p.x; touch.my = p.y;
+      } else if (touch.aimId !== null && touch.aimId === e.pointerId) {
+        touch.ax = p.x; touch.ay = p.y;
+        aimPoint.x = p.x; aimPoint.y = p.y;
+      }
+      return;
+    }
+    mouse.x = p.x; mouse.y = p.y;
+    aimPoint.x = p.x; aimPoint.y = p.y;
+  }
+
+  function onPointerUp(e) {
+    if (isTouchPointer(e)) {
+      if (touch.moveId === e.pointerId) touch.moveId = null;
+      else if (touch.aimId === e.pointerId) touch.aimId = null;
+      return;
+    }
+    mouse.down = false;
+  }
+
+  window.addEventListener('keydown', function (e) {
+    const k = e.key.toLowerCase();
+    keys[k] = true;
+    if (k === 'escape') {
+      if (S.settings) { S.settings = false; }
+      else if (S.state === 'playing' || S.state === 'break') { S.pauseReturn = S.state; S.state = 'paused'; }
+      else if (S.state === 'paused') S.state = S.pauseReturn || 'playing';
+    }
+    if (k === 'm') S.muted = !S.muted;
+    if (k === 'r' && (S.state === 'dead' || S.state === 'win' || S.state === 'title')) reset();
+    if ((k === ' ' || k === 'enter') && S.state === 'title') reset();
+    if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].indexOf(k) >= 0) {
+      e.preventDefault();
+    }
   });
-  cv.addEventListener('pointerup', function () { mouse.down = false; });
-  cv.addEventListener('pointercancel', function () { mouse.down = false; });
-  window.addEventListener('blur', function () { mouse.down = false; });
+  window.addEventListener('keyup', function (e) { keys[e.key.toLowerCase()] = false; });
+  cv.addEventListener('pointermove', function (e) { onPointerMove(e); });
+  cv.addEventListener('pointerdown', function (e) { onPointerDown(e); });
+  window.addEventListener('pointermove', function (e) { onPointerMove(e); });
+  window.addEventListener('pointerup', function (e) { onPointerUp(e); });
+  window.addEventListener('pointercancel', function (e) { onPointerUp(e); });
+  window.addEventListener('blur', function () { mouse.down = false; touchReset(); });
+  window.addEventListener('contextmenu', function (e) {
+    // 手机上长按别弹右键菜单/放大镜
+    if (MOBILE) e.preventDefault();
+  });
+  cv.addEventListener('dblclick', function (e) { e.preventDefault(); });
   window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', function () { setTimeout(resize, 120); });
 
   // ==================== 调试 / 自动化钩子 ====================
   window.__GAME = {
@@ -1349,8 +1823,12 @@
     pack: function (k) { spawnPack(k); },
     packs: function () { return S.packs.length; },
     shieldMax: shieldMax,
+    get mobile() { return MOBILE; },
+    setMobile: setMobileMode,
+    get settings() { return S.settings; },
   };
 
   resize();
   requestAnimationFrame(frame);
 })();
+
